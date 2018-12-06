@@ -1,0 +1,861 @@
+---
+title: "Analysis of Lending Club Loan Approval"
+author: "Brian Clare"
+header-includes:
+    - \usepackage{setspace}\doublespacing
+date: "November 27, 2018"
+output: 
+  pdf_document:
+    toc: True
+    toc_depth: 2
+  
+---
+
+```{r setup, include=FALSE}
+library(arm)
+library(lme4)
+library(data.table)
+library(tidyverse)
+library(magrittr)
+library(lubridate)
+library(knitr)
+library(kableExtra)
+library(randomForest)
+knitr::opts_chunk$set(echo = TRUE, fig.width = '\\textwidth', out.width = '\\textwidth', out.height = '.55\\textwidth', 
+                      message = FALSE, warning = FALSE, comment = "|")
+```
+
+\pagebreak
+
+# Project Summary
+
+This report details several steps of analysis of publicly available data from Lending Club on approved and declined loans. There are over 2 million approved loans and over 23 million declined loans. The first steps of analysis are to explore the variables available. I found that the most relevant variables were debt-to-income ratio, loan purpose, and employment length - specifically if employment length was 1 year or 5 years that was associated with a decrease in loan approval rate.
+
+I fit three different statistical models for predicting loan approval on a sample of the data. I measured each of them both in terms of their predictive accuracy on a test set, and also their ability to correctly identify approved loans (sensitivity). The first, a standard logistic regression, had 95% overall accuracy and 77% sensitivity. A multi-level logistic regression was also tested, but could at best replicated the standard logistic regression results. A random forest model had only 92% accuracy, but better sensitivity at 86%.
+
+Overall it was encouraging that the loan approval process could be effectively modelled using only a few variables. With more time spent tuning and exploring types of models, and time spent incorporating geographic information, I believe this results could be improved further.
+
+
+\pagebreak
+
+# What is Lending Club?
+
+Lending Club is a peer-to-peer lending company founded in 2007 and registered with the Securities and Exchange Commission in 2008. Lending Club had an Initial Public Offering in 2014 and is a publicly traded stock on the NYSE. Individuals can apply for loans of \$1,000 to \$40,000 on Lending Club's website, including their personal details, income, credit history etc. Lending Club determines credit-worthiness and assigns approved loans a credit grade and interest rate. Partner banks officially issue the loans, but anyone can purchase notes ($25 shares of a loan) through Lending Club's website as an "investor".
+
+Lending Club's website offers .csv files for download with information on all loans that have been approved or declined on the platform since 2007. There are many more fields available for approved loans than declined, and some fields that have been added more recently (and thus are NAs for older loans).
+
+My main interest for this project is comparing loans that were approved to those that were declined; I hope to build a model that can predict with good accuracy based on the characteristics of the loan and the borrower whether or not the loan will be approved. Along the way, I'll also do some exploratory analysis and visualizations on some of the available data that I think may be relevant.
+
+\pagebreak
+
+# Lending Club Data
+
+Lending Club's website splits up the data into many files; 15 separate files for approved loans and 14 for declined loans. The early years of the company are grouped together, but starting in 2016 the files are released quarterly. My analysis is through Q3 of 2018, the last released files.
+
+For declined loans, there are 9 total fields, most of which are fairly self-explanatory, but a data dictionary provided by Lending Club adds some useful information
+
+* Amount Requested
+* Application Date
+* Loan Title: it seems this was originally a typed in field, resulting in many distinct values. Sometime in 2015 or 2016 it was converted to a selection from a list
+* Risk Score: Until 2013 this is a FICO score, afterwards switches to Vantage. This is very relevant for analysis because although the scores use similar scales, they are not equivalent.
+* Debt-to-Income Ratio
+* Zip Code: first three digits only, which makes it difficult to cross-reference with anything else
+* State
+* Employment Length: In years, an integer from 1 to 10 where 1 means 1 year or less and 10 means 10 years or more
+* Policy code: An indicator variable for loans that fall below the regular credit policy standards and are not available to most investors
+
+For approved loans, the same fields are included (but often with different names and formatting), along with 142 other fields, mostly having to do with credit history. Because my main interest is modelling loan approval, the fields that are unavailable on declined loans aren't very useful to me.
+
+Having identified the potentially usable values, we now have the matter of filtering and cleaning data, in connection with exploratory analysis of those variables.
+
+### Amount
+
+In the declined loans file, this is called "Amount Requested". In the approved loans, there are three values: loan_amnt, funded_amnt, and funded_amnt_inv. Those represent respectively the applied amount, the amount covered by Lending Club, and the amount covered by Lending Club investors. For the majority of records the three fields have the same value. When the values differ, loan_amnt is most likely to be a direct equivalent to the declined loan field "Amount Requested". In the combined dataset, the field is called amount. I've also filtered out any loans with listed amount less than \$1000 or greater than \$40,000; Lending Club's website lists that as the possible range of loans.
+
+### Date
+
+Declined loans have "Application Date". Approved loans have "issue_d" for issue date. Although application date and issue date should be close to each other in time, they are not exactly identical measurements. I've limited the date value to just year in the combined dataset, and due mostly to issues with the loan title field there was also a filter applied to use only records from 2015 and onward. Since Lending Club had their IPO in December 2014, this is also a rational breakpoint where the company, its borrowers and its investors may have changed their behaviors and standards with regards to loan applications.
+
+### Loan Title
+
+This field exists in the declined loans dataset as "Loan Title" which is provided by the borrower, and in the approved loans dataset as "title", the loan title provided by the borrower, and "purpose", which is one of about 14 categories (including 'other'). As the title is provided by the borrower, there was an almost overwhelming diversity of titles for declined loans from 2007 through 2014 with hundreds or thousands of distinct titles per year, but then no more than 40 per year after 2015. Minimal data cleaning was required to use the 2015-2018 loan titles as modeled groups. Appendix I of this report has more detail on the data cleaning, and Appendix II has brief analysis of the years before 2015.
+
+### Risk Score
+
+For declined loans, the type of score reported in this field changes from FICO to Vantage in late 2013. Approved loans in all years have a FICO score range at loan origination, reported as two values, fico_range_high and fico_range_low, although these fields are missing in the latest file, 2018 Q3. Unfortunately in the date range of 2015 onward, the FICO scores from approved loans and Vantage scores from declined loans cannot be compared one-to-one, nor is there any simple conversion, nor do those two scores even use the exact same range. It could be possible to analyze pre-2013  applications using FICO score as a predictor, but that would be less relevant to future loan applications. For this reason, Risk Score was not included in my final models, although some exploratory analysis was done (see Appendix II)
+
+### Debt to Income Ratio
+
+This is calculated and reported the same way for both declined and approved loans, as a percentage (that is, 25% is marked as 25, not a proportion as 0.25). A small number of records were NA or -1, both of which were filtered out. As we'll see in the exploratory analysis soon, debt to income ratio will be log-transformed for the final model.
+
+### Zip Code
+
+The same in both datasets, zip codes are included but only the first 3 digits. This causes difficulty when trying to to cross-reference economic and demographic information that is organized by (full) zip code or by census tract.
+
+### State
+
+No difficulties here. Straightforward, same formatting and reporting for both declined and approved loans.
+
+### Employment Length
+
+This needed to be converted from a string to a number; a bit of precision is lost because a value of 10 means 10 years or more, but otherwise this was fairly straightforward as well.
+
+### Policy Code
+
+Coded as 0 or 1 (approved loans) or as 0 or 2 (declined loans). The exact meaning of policy code is a bit hazy, and non-zero policy codes comprised less than 1% of the data in each category and each year. Because these loans seem to be handled a bit differently than others, they've been excluded from my further analysis.
+
+\pagebreak
+
+# Exploratory Data Analysis
+
+Exploratory analysis in this context consists of investigating the data through summary statistics, visualizations, and perhaps some simple modeling.
+
+The first variable I investigated was the amount requested in loans. The goals here are to understand the distribution of amount and how amount requested might be correlated with approval. We begin here with an R dataframe called full_data that contains all of the approved and declined loans, after the data cleaning and filtering steps have been taken. A variable named "approved" has been added, to indicate the decision on the loan; 1 means approved, 0 means declined.
+
+First a quick summary of the amounts, then that same summary for approved and declined loans
+
+```{r, include = FALSE}
+full_data <- fread("FINAL DATA.csv")
+full_data$approved %<>% as.factor()
+```
+
+```{r, echo = FALSE}
+cat("Summary of amount\n")
+summary(full_data$amount)
+cat("\nSummary of amount for approved loans\n")
+summary(full_data$amount[full_data$approved == "1"])
+cat("\nSummary of amount for declined loans\n")
+summary(full_data$amount[full_data$approved == "0"])
+```
+
+It may be surprising that approved loans had slightly higher amounts on average than declined loans, but there are obviously more relevant variables involved.
+
+Next let's see a histogram of amounts, colored by loan approval;
+
+```{r, echo = FALSE}
+ggplot(data = full_data) + geom_histogram(aes(x = amount, fill = approved), bins = 40) +
+  scale_fill_manual(name = "round_amt", labels = c("Declined", "Approved"),
+                      values = c("#FF3333", "#009E73")) +
+  scale_y_continuous(labels = scales::comma, name = NULL) +
+  guides(fill=guide_legend(title=NULL))
+```
+
+What stands out here are the spikes in declined loans, and to a lesser extent in approved loans, at what seems like multiples of \$5000. Let's see how approval rate changes in general as amount changes, then come back to those spikes
+
+```{r, echo = FALSE}
+amounts <- full_data %>% select(amount, approved)
+amounts %<>% mutate(rounded = round(amount, digits = -3))
+amounts$rounded %<>% as.factor()
+amounts %<>% group_by(rounded) %>% summarize(count = n(), 
+                    approval = sum(as.numeric(approved) - 1) / count)
+```
+
+```{r, echo = FALSE}
+ggplot(data = amounts) + geom_col(aes(x = rounded, y = approval, fill = count)) +
+  scale_x_discrete(name = "Rounded Amount", breaks = seq(5000, 40000, 5000)) + 
+  ylab("Proportion Approved") + 
+  scale_fill_gradientn(labels = scales::comma, colors = rev(rainbow(4)))
+```
+
+We see here the dips in approval rate but spikes in overall frequency for the multiples of \$5,000. Here's a slightly different look
+
+```{r, echo = FALSE}
+s <- summary(full_data$approved[full_data$amount == 10000])
+s1 <- unname(s[2] / sum(s))
+str_glue("For $10,000 loan applications, approval rate is {s1}")
+
+s <- summary(full_data$approved[full_data$amount > 9000 & full_data$amount < 10000])
+s1 <- unname(s[2] / sum(s))
+str_glue("For $9,000 to $9,999 loan applications, approval rate is {s1}")
+
+s <- summary(full_data$approved[full_data$amount > 10000 & full_data$amount < 10999])
+s1 <- unname(s[2] / sum(s))
+str_glue("For $10,000 to $10,999 loan applications, approval rate is {s1}")
+```
+
+
+Another quick check now: have those spikes at round numbers existed in every year, or is there a trend over time? I've included an indicator variable named round_amt, which has a value of 1 when the amount for that loan is a multiple of \$5,000 and a value of 0 otherwise.
+
+```{r, echo = FALSE}
+ggplot(data = full_data) + geom_histogram(aes(x = amount, fill = as.factor(year)), bins = 40) +
+  scale_fill_discrete(name = "Year") + xlab("Loan Amount") + 
+  scale_y_continuous(labels = scales::comma, name = "") + facet_wrap(~year) +
+  guides(fill = FALSE)
+```
+
+```{r, echo = FALSE}
+ggplot(data = full_data) + geom_bar(aes(x = as.factor(year), fill = as.factor(round_amt))) +
+  scale_fill_manual(name = "round_amt", labels = c("Not 'Round Amount'", "Round Amount"),
+                    values = c("#FF3333", "#009E73")) +
+  xlab("Year") + scale_y_continuous(labels = scales::comma, name = NULL) + 
+  guides(fill=guide_legend(title=NULL))
+```
+
+These graphs demonstrate that "round amounts" have been common throughout the 4 years that I'm analyzing, although the spikes don't seem to have been as extreme in 2015 and 2016.
+
+
+It's impossible to know for sure why round number amounts are less likely to be approved for loans than other values, but one hypothesis seems reasonable. When a person applies for a loan and says they need exactly \$10,000, it can seem like that was just a nice number they plucked out of thin air. When a person applies for a loan for \$9,855 that seems like it must have been calculated based on specific expenses. With the limited information made public about declined loans, I can't say whether the round numbers themselves are the cause of loans not being approved, or if they're merely indicators of uncreditworthiness in other variables which we may not have access to.
+
+Next we'll take a look at the different loan titles, the average approval rates of different loans, and how their frequencies have changed over time. Although there are 14 tracked loan titles, 5 of them are quite uncommon so graphics will display only the top 8 titles.
+```{r, echo = FALSE}
+large_groups <- c("automotive", "credit card refinancing", 
+                      "debt consolidation", "home buying", "home improvement",
+                      "medical", "moving", "other")
+
+linebreak_labels <- c("Automotive", "Credit Card\nRefinancing", 
+                      "Debt\nConsolidation", "Home\nBuying", "Home\nImprovement",
+                      "Medical", "Moving", "Other")
+
+title_labels <- large_groups %>% str_to_title()
+```
+
+```{r, echo = FALSE}
+ggplot(data = full_data %>% filter(Title %in% large_groups)) +
+  geom_bar(aes(x = as.factor(Title), fill = approved)) +
+  scale_y_continuous(labels = scales::comma, name = NULL) +
+  scale_x_discrete(name = "Loan Title", labels = linebreak_labels) + 
+  scale_fill_manual(name = NULL, labels = c("Declined", "Approved"), 
+                      values = c("#FF3333", "#009E73")) +
+  theme(axis.text.x = element_text(size = 8),
+        axis.title.x = element_text(size = 10))
+```
+
+```{r, echo = FALSE}
+ggplot(data = full_data %>% filter(Title %in% large_groups)) + 
+  geom_bar(aes(x = as.factor(year), fill = approved)) +
+  facet_wrap(~factor(Title, labels = title_labels)) + 
+  guides(fill=guide_legend(title=NULL)) +
+  scale_y_continuous(labels = scales::comma, name = NULL) +
+  scale_fill_manual(labels = c("Declined", "Approved"), values = c("#FF3333", "#009E73")) + 
+  scale_x_discrete(name = "Year")
+```
+
+```{r, echo = FALSE}
+ggplot(data = full_data %>% filter(Title %in% large_groups)) + 
+  geom_bar(aes(x = as.factor(year), fill = as.factor(Title))) + 
+  scale_y_continuous(labels = scales::comma, name = NULL) +
+  scale_fill_discrete(name = NULL, labels = title_labels) + 
+  scale_x_discrete(name = "Year")
+```
+
+It should be noted here that 2018 data is only through the 3rd quarter; so although Debt Consolidation appears to have decreased in share from 2017 that may not be true including Q4 of 2018. Overall the distribution of loan titles appears to be fairly stable, with slight upticks in relative frequency of home buying and credit card refinancing and slight downticks in home improvement and debt consolidation.
+
+Let's take a look now at employment length - how it is distributed and how it relates to loan approval.
+
+```{r, echo = FALSE}
+ggplot(data = full_data) + 
+  geom_bar(aes(x = as.factor(emp_length), fill = approved)) + 
+  scale_y_continuous(name = "Loan Applications", labels = scales::comma) + 
+  scale_x_discrete(name = "Employment Length in Years") +
+  scale_fill_manual(name = NULL, labels = c("Declined", "Approved"), 
+                    values = c("#FF3333", "#009E73"))
+```
+
+There are 3 spikes here at 1, 5 and 10 years. More than half of all loan applicants had an employment length of 1 year. It's hard to tell on this graph exactly how the approval rates stack up, so let's take a better look:
+
+```{r, echo = FALSE}
+by_emplength <- full_data %>% group_by(as.factor(emp_length)) %>% 
+  summarize(count = n(), approval = mean(approved %>% as.numeric - 1))
+colnames(by_emplength) <- c("Employed Length (in years)", "Number of Loans Applied", "Approval Rate")
+
+kable(by_emplength) %>% column_spec(1:3, width = "1.3in")
+```
+
+As we can see, there are extremely low approval rates for employment length of 1 or 5 years, and quite high rates for all other values. We should still check if this has persisted over several years, or there's a trend
+
+```{r, echo = FALSE}
+ggplot(data = full_data) + geom_bar(aes(x = as.factor(year), fill = as.factor(emp_length))) +
+  scale_fill_discrete(name = "Employment Length, in Years") + 
+  scale_y_continuous(labels = scales::comma, name = "Number of Loan Applications") +
+  scale_x_discrete(name = "Year")
+```
+
+So in all of these years a majority of loan applicants had 1 year employment length, with 5 being the second most common value. 5 years was particularly common in 2016 and 2017 but not so much in 2015 or so far in 2018. I've added another indicator variable to the data called "emp51", which takes a value of 1 when the applicant's employment length is 1 year or 5 years, and 0 otherwise.
+
+```{r, echo = FALSE}
+ggplot(data = full_data) + geom_bar(aes(x = as.factor(year), fill = as.factor(emp51))) +
+  scale_fill_discrete(name = NULL, labels = c("Any other length", "Employed 1 or 5 years")) + 
+  scale_y_continuous(labels = scales::comma, name = "Number of Loan Applications") +
+  scale_x_discrete(name = "Year")
+```
+
+```{r, echo = FALSE}
+by_emp51 <- full_data %>% group_by(as.factor(emp51)) %>% 
+  summarize(count = n(), approval = mean(approved %>% as.numeric - 1))
+colnames(by_emp51) <- c("Years Employed", "Number of Loans Applied", "Approval Rate")
+by_emp51$`Years Employed` <- ifelse(by_emp51$`Years Employed` == 1, "1 or 5", "Any Other Length")
+
+kable(by_emp51)
+```
+
+Moving on, debt-to-income ratio is almost certainly going to be relevant to loan approval. Although credit rating agencies don't disclose their exact methods for calculating credit scores, FICO does disclose that utilization ratio (amount of outstanding debt relative to credit limit) is a major factor. Debt-to-income ratio is another similar measure that can be used to judge an individual's ability to pay back a potential loan. Let's see how debt-to-income scores are distributed among approved and declined loans. Recall that this measurement is a percentage.
+
+```{r, echo = FALSE}
+cat("Debt-to-income ratio for approved loans\n")
+summary(full_data$debt_to_income[full_data$approved == "1"])
+
+cat("\nDebt-to-income ratio for declined loans\n")
+summary(full_data$debt_to_income[full_data$approved == "0"])
+```
+
+```{r, echo = FALSE}
+ggplot(full_data %>% filter(debt_to_income < 100)) + 
+  geom_histogram(aes(x = debt_to_income, fill = approved), binwidth = 5) +
+  scale_y_continuous(labels = scales::comma, name = "Number of Loan Applications") +
+  scale_fill_manual(name = NULL, labels = c("Declined", "Approved"),
+                      values = c("#FF3333", "#009E73")) + 
+  scale_x_continuous(name = "Debt-to-Income Ratio")
+```
+
+This graph has been cut off so we can see the shape; there are a few extremely large values off-screen to the right. This is a skewed distribution, and normal statistical wisdom is to take the logarithm of the variable to help control the variability. There's also a small adjustment to avoid errors with log(0). In modeling we'll use a new variable "log_dti", and when summarizing debt-to-income ratio we'll use median as more representative than mean.
+
+```{r, echo = FALSE}
+ggplot(full_data %>% filter(log_dti < 12)) + 
+  geom_histogram(aes(x = log_dti, fill = approved), binwidth = 0.5) +
+  scale_y_continuous(labels = scales::comma, name = "Number of Loan Applications") +
+  scale_fill_manual(name = NULL, labels = c("Declined", "Approved"), 
+                      values = c("#FF3333", "#009E73")) + 
+  scale_x_continuous(name = "Log(Debt-to-Income Ratio)")
+```
+
+That's quite a bit nicer. The steep drop-off around log(debt-to-income) = 4.5 corresponds to about a debt-to-income ratio of 100%; presumably not many people have more debt than income, and those who do either don't bother applying for loans or they lie about their debt.
+
+```{r, echo = FALSE}
+log_dti_by_year <- full_data %>% group_by(as.factor(year), approved) %>%
+  summarize(count = n(), median_dti = median(debt_to_income)) %>% ungroup()
+colnames(log_dti_by_year) <- c("year", "approved", "count", "dti")
+
+ggplot(data = log_dti_by_year) + geom_col(aes(x = year, y = dti, fill = approved), position = "dodge") +
+  scale_fill_manual(name = NULL, labels = c("Declined", "Approved"),
+                      values = c("#FF3333", "#009E73")) +
+  scale_y_continuous(name = "Median Debt-to-Income Ratio") + 
+  xlab("Year")
+```
+
+Our summaries above showed the median debt-to-income ratio for declined loans was higher than for approved loans, so it should not be a shock that that was true for each of these years. There's a very slight trend of separation; lower debt-to-income ratios are needed for approval, and more people with high debt-to-income ratios are applying for loans and being declined. Still, a trend over 4 years is far from conclusive.
+
+At this point, we can say the most relevant factors in loan approval are probably the following:
+* Employment length of 1 or 5 years
+* Requesting a "round amount"
+* Debt-to-Income ratio (log-transformed)
+* Loan title / category
+
+Before building any models, we should check the relationships of these variables to each other. Two strongly correlated variables don't need to be included in the same model.
+
+First, we'll look at how the round amount and employment length categories are related to debt-to-income ratio
+
+```{r, echo = FALSE}
+cat("Summary of log(debt-to-income) for applicants with 1 or 5 years employment\n")
+summary(full_data$log_dti[full_data$emp51 == "1"])
+cat("\nSummary of log(debt-to-income) for all other applicants\n")
+summary(full_data$log_dti[full_data$emp51 == "0"])
+cat("\nCorrelation between log(debt-to-income) and emp51 indicator variable\n")
+cor(full_data$log_dti, full_data$emp51)
+```
+
+```{r, echo = FALSE}
+cat("Summary of log(debt-to-income) for loan applications for round amounts\n")
+summary(full_data$log_dti[full_data$round_amt == "1"])
+cat("\nSummary of log(debt-to-income) for all other amounts\n")
+summary(full_data$log_dti[full_data$round_amt == "0"])
+cat("\nCorrelation between log(debt-to-income) and round_amt indicator variable\n")
+cor(full_data$log_dti, full_data$round_amt)
+```
+
+Those summaries don't show very much difference between the log(debt-to-income) values, which is a good thing if we want to be able to use all of these variables in a model. There's a very weak relationship that applicants with 1 or 5 years of experience, and applicants asking for round amounts both are likely to have higher debt-to-income ratios. This aligns with what we already know about those groups having lower acceptance rates, but the correlation is low enough that we can consider these separate effects.
+
+Next let's examine round amounts and employment length together; if they are both indicators of un-creditworthiness, they might coincide very frequently.
+
+```{r, echo = FALSE}
+tbl <- table(full_data$emp51, full_data$round_amt)
+same <- tbl[1, 1] + tbl[2, 2]
+diff <- tbl[1, 2] + tbl[2, 1]
+total <- sum(tbl)
+round <- sum(full_data$round_amt) # sum(tbl[, 2])
+emp <- sum(full_data$emp51)       # sum(tbl[2, ])
+emp_not_round <- tbl[2, 1]
+round_not_emp <- tbl[1, 2]
+
+str_glue("{format(same / total, digits = 3)} is the proportion of all applicants with the same indicator for emp51 and round_amt\n")
+str_glue("{format(tbl[2,2] / round, digits = 3)} is the proportion of those with round amounts who also have emp51\n")
+str_glue("{format(tbl[2,2] / emp, digits = 3)} is the proportion of those with emp51 who also have round amounts\n")
+```
+
+What we're learning here is that the overwhelming majority of those who asked for nice round amounts of money also reported 1 or 5 years employment length. Let's take a peek at acceptance for loan applicants based on both group indicators
+
+```{r, echo = FALSE}
+s <- summary(full_data$approved[full_data$emp51 == 1 & full_data$round_amt == 1])
+s1 <- unname(s[2] / sum(s))
+str_glue("For both emp51 and round_amt, approval rate is {s1}")
+
+s <- summary(full_data$approved[full_data$emp51 == 1 & full_data$round_amt == 0])
+s2 <- unname(s[2] / sum(s))
+str_glue("For emp51 but not round_amt, approval rate is {s2}")
+
+s <- summary(full_data$approved[full_data$emp51 == 0 & full_data$round_amt == 1])
+s3 <- unname(s[2] / sum(s))
+str_glue("For round_amt but not emp51, approval rate is {s3}")
+
+s <- summary(full_data$approved[full_data$emp51 == 0 & full_data$round_amt == 0])
+s4 <- unname(s[2] / sum(s))
+str_glue("For neither, approval rate is {s4}")
+
+```
+ So now we've unraveled a mystery: it seems that being employed for 1 or 5 years is what really sinks your chances; asking for a round number by itself isn't as much of a problem as long as you have employment history. With this information, round_amt no longer appears to be a necessary feature for modeling.
+ 
+Moving on, let's see if Title is related to our other remaining variables of interest, emp51 and debt-to-income ratio
+
+```{r, echo = FALSE}
+title_summaries <- full_data %>% filter(Title %in% large_groups) %>% group_by(Title) %>% 
+  summarize(proportion_emp51 = mean(emp51), median_dti = median(debt_to_income), 
+            decline = 1 - mean(as.numeric(approved)-1)) %>% 
+  arrange(desc(proportion_emp51))
+
+colnames(title_summaries) <- c("Loan Title", "Proportion emp51", "Median Debt-to-Income", "Proportion Declined")
+title_summaries$`Loan Title` %<>% str_to_title()
+title_summaries$`Proportion emp51` %<>% format(digits = 3)
+title_summaries$`Proportion Declined` %<>% format(digits = 3)
+
+kable(title_summaries)
+
+```
+
+We see quite a bit of variation here between title groups. With the exception of business loans, proportion of applicants with 1 or 5 years employment length seems very well correlated with proportion declined (or inversely correlated with proportion accepted). The trend is less clear between debt-to-income ratio and approval by group. Overall, it seems as though some of the difference in approval rates in the title groups can be explained by the the employment and debt-to-income criteria, but certainly not all.
+
+Here's another look at how employment length of 1 or 5 years is a very impactful variable in each title group:
+
+```{r, echo = FALSE}
+title_emp <- full_data %>% filter(Title %in% large_groups) %>% group_by(Title, emp51) %>% 
+  summarize(approval = mean(as.numeric(approved)-1))
+
+title_emp %<>% spread(emp51, approval) %>% select(Title, `1`, `0`) %>% arrange(desc(`1`))
+colnames(title_emp) <- c("Loan Title", "Approval Rate: emp51", "Approval Rate: others")
+
+title_emp$`Approval Rate: emp51` %<>% format(digits = 3)
+title_emp$`Approval Rate: others` %<>% format(digits = 3)
+
+kable(title_emp)
+```
+
+At the end of this exploratory analysis, we have 3 features that we plan to use in modeling loan approval: the title / purpose of the loan, the logarithm of debt-to-income ratio, and and indicator for whether employment length was equalled 1 year or 5 years.
+
+```{r, include = FALSE}
+rm(full_data)
+```
+
+\pagebreak
+
+# Modeling Loan Approval
+
+Now that we've discussed all of the variables, created a few new ones, done a transformation and generally gained an understanding of the relationships, we move on to building a model to try to predict loan approval. Although it's nice to have over 20 million records of loan applications, modeling on that amount of data would be computationally difficult on my laptop. I've taken a sampling approach instead; fitting a model on a representative sample of training data allows us to validate the model on a larger test sample and show that the model fits the data generally.  
+  
+Since the response variable in this problem is a binary classification (approved or declined) the simplest method to use is logistic regression; the regression will output a value between 0 and 1, where anything over 0.5 is interpreted as predicting approval. One important concern with this binary classifier is that in our full dataset, only about 7% of the loans are approved. Therefore, the very simple model of always predicting loan declined would have 93% accuracy and by that measure seems to be a good fit.  
+  
+That model however is bad when we include measures of sensitivity (proportion of true positives predicted correctly) and specificity (proportion of true negatives predicted correctly). This model has 0% sensitivity, 100% specificity. Generally we'd like those values to be fairly close to each other. However with this unbalanced data set, almost any logistic regression model is guaranteed to have low sensitivity; most of its errors will be in failing to predict loan approval, because loan approval is a rare event. To combat this, our sample will be constructed to be split equally between approved and declined loans. This may result in a lower overall accuracy, but better sensitivity.  
+  
+A sample of 100,000 loans has been drawn; 50,000 from the 1,433,012 approved loans (about 3%), and 50,000 from the 19,159,873 declined loans (about .2%). This is certainly a large enough sample, but still only small proportions of the total data.  
+
+
+```{r, include = FALSE}
+mlm <- read_rds("mlm simple")
+glm <- read_rds("glm model")
+rf <- read_rds("random forest")
+sample <- read_csv("sample 100k full data.csv")
+sample$round_amt %<>% as.factor()
+sample$emp51 %<>% as.factor()
+sample$state %<>% as.factor()
+sample$year %<>% as.factor()
+
+test <- read_csv("test 200k.csv")
+test$round_amt %<>% as.factor()
+test$emp51 %<>% as.factor()
+test$state %<>% as.factor()
+test$year %<>% as.factor()
+```
+
+### Logistic Regression
+
+We will compare a few models fit to the same training data. The first is a standard logistic regression, implemented in R as a generalized linear model (glm) with a logit link function.
+
+```{r, echo = FALSE}
+display(glm)
+```
+
+This model uses coefficients of log_dti, emp51 and log_dti * emp51 (the interaction) to estimate the logit transformation of the probability of loan approval. When logit(probability) increases or decreases, probability will do the same, but not by the same amount (since probabilities are bounded by 0 and 1).
+
+We can interpret this regression output as two separate situations: one where emp1 = 0 (employment length is not 1 year or 5 years) and one where emp1 = 1 (hence "emp11").
+
+* emp1 = 0: For each increase of 1 in log_dti (e = 2.7 times as much in actual debt-to-income ratio), logit(probability of approval) increases by 0.11, therefore probability increases by a little. This is a little counter-intuitive, that debt-to-income ratio increasing would correlate with approval increasing.
+
+* emp1 = 1: For each increase of 1 in log_dti, logit(probability of approval) changes by 0.11 + (-0.27) = decreasing by 0.16, therefore probability of approval decreases by a bit.
+
+For a more practical evaluation of the model, we'll apply its predictions to a test set of 200,000 loans randomly selected from the full population, then check how the predictions do compared to the true results.
+
+```{r, echo = FALSE}
+test$glm <- invlogit(predict(glm, test, allow.new.levels = TRUE))
+test$glm <- ifelse(test$glm > 0.5, 1, 0)
+table2 <- table(test$approved, test$glm)
+
+approval <- mean(test$approved)
+
+acc_glm <- (table2[1,1] + table2[2,2]) / (sum(table2))
+
+sens_glm <- table2[2,2] / sum(table2[2, ])
+spec_glm <- table2[1,1] / sum(table2[1, ])
+
+str_glue("Test set accuracy is {format(acc_glm, digits = 3)}")
+str_glue("Test set sensitivity is {format(sens_glm, digits = 3)}")
+str_glue("Test set specificity is {format(spec_glm, digits = 3)}")
+str_glue("Test set true approval rate is {format(approval, digits = 3)}")
+```
+
+Thankfully, we've beaten the baseline "always guess declined" accuracy of 1 - 0.0702 = 93%, and with much better sensitivity. Still not great though; let's see if another model can do better.
+
+\pagebreak
+
+### Multi-Level Model
+
+Multi-level models are useful when data is grouped and coefficients cacn vary by group. I was hopeful that this approach might be fruitful on this data, with the groups being either by loan title or by 
+the emp51 indicator. Let's see how a multi-level logistic regression does.
+
+```{r, echo = FALSE}
+display(mlm)
+```
+
+```{r, echo = FALSE}
+test$mlm <- invlogit(predict(mlm, test, allow.new.levels = TRUE))
+test$mlm <- ifelse(test$mlm > 0.5, 1, 0)
+table1 <- table(test$approved, test$mlm)
+
+acc_mlm <- (table1[1,1] + table1[2,2]) / (sum(table1))
+
+sens_mlm <- table1[2,2] / sum(table1[2, ])
+spec_mlm <- table1[1,1] / sum(table1[1, ])
+
+str_glue("Test set accuracy is {format(acc_mlm, digits = 3)}")
+str_glue("Test set sensitivity is {format(sens_mlm, digits = 3)}")
+str_glue("Test set specificity is {format(spec_mlm, digits = 3)}")
+str_glue("Test set true approval rate is {format(approval, digits = 3)}")
+```
+
+Well that's not bad, but I can't say it's good. In fact it's exactly the same as our regular glm model from before; this is in fact the best-performing multi-level model that I could construct after quite a few attempts, which are included in Appendix III. None of them could beat this model, which reduces to a standard glm.
+
+Group effects for loan title were not useful enough to include in the model. It's possible that applicant job title or location would be effective grouping variables, but those were not defined in a way that they could be applied here. Applicant job title and income were only provided for approved loans, and location data is only available as groups of zip codes, which are not a fine enough measurement to see large variations.
+
+\pagebreak
+
+### Random Forest
+
+To wrap up, we'll look at a very different type of model - a random forest. Random forests are ensemble models made by averaging the predictions of many randomly generated decision tree models. One drawback to random forests is that they can be difficult to interpret; let's start by looking at the test accuracy
+```{r, echo = FALSE}
+test$Title %<>% as.factor()
+test$approved %<>% as.factor()
+
+test$rf <- predict(rf, test)
+table3 <- table(test$approved, test$rf)
+
+acc_rf <- (table3[1,1] + table3[2,2]) / (sum(table3))
+
+sens_rf <- table3[2,2] / sum(table3[2, ])
+spec_rf <- table3[1,1] / sum(table3[1, ])
+
+str_glue("Test set accuracy is {format(acc_rf, digits = 3)}")
+str_glue("Test set sensitivity is {format(sens_rf, digits = 3)}")
+str_glue("Test set specificity is {format(spec_rf, digits = 3)}")
+str_glue("Test set true approval rate is {format(approval, digits = 3)}")
+```
+
+With this model, we actually have lower accuracy than if we had predicted every loan were declined, but 86.1% sensitivity is significantly better than our previous attempts. It's possible the random forest would have been less bothered by the unbalanced training set, and because it trained on a 50-50 split that's why it is not overestimating approvals.
+
+One of the useful features of random forests is that they can handle spikes and weird non-linearities such as the round amounts and employment of 1 and 5 years; the random forest model was actually trained on the raw data of amount and employment length, not the indicator variables.
+
+A step that can be taken to interpret the results of a random forest model is to look at variable importance.
+
+```{r, echo = FALSE}
+imp <- as.data.frame(importance(rf)) %>% mutate(variable = row.names(.)) %>%  arrange(desc(MeanDecreaseGini)) %>% select(Variable = variable, Importance = MeanDecreaseGini)
+kable(imp)
+```
+ 
+Importance here is roughly a measure of how much decision splits on that variable decrease help the model fit. This table doesn't tell us which direction the correlations go, but we've already seen how employment length, debt-to-income ratio and amount are generally related to loan approval. The remaining three variables here don't contribute a lot, but that was also about what we expected.
+  
+\pagebreak
+
+# Conclusion
+
+Overall it was encouraging that the loan approval process could be effectively modelled using only a few variables. With more time spent tuning and exploring types of models I believe these results could be improved further. There is a fundamental friction between sensitivity and specificity for classification models, so anyone working on these models must understand the relative concerns of false positives (predicting a loan will be approved when it is not) versus false negatives (predicting a loan will be declined when it will actually be approved).
+
+There are two clear variables to target for improving loan approval models: geographic data and credit scores. Currently Lending Club only provides the first 3 digits of zip codes for applicants, which means the smallest areas that can be examined still have populations in the millions. The finer location data which would be necessary for looking for evidence of redlining or other practices is not available. With full zip codes or census tracts it would be possible to determine if Lending Club's approval process is affected by location.
+
+Credit scores in Lending Club's data are a more frustrating problem. Since Vantage scores given for declined loans and FICO scores given for approved loans are not comparable, credit scores cannot be used in predicting loan approval. If Lending Club ever changes their data reporting to be consistent across approved and declined loans, then credit scores would likely be a useful predictor. Almost certainly credit scores would be highly correlated with debt-to-income ratio, but perhaps with more predictive value.
+
+
+\pagebreak
+
+# Appendix I - Data Cleaning
+
+The full unfiltered set of declined loans had 25,054,319 records. The unfiltered set of approved loans had 2,132,285
+
+The following table summarizes the steps taken to filter the data, and the number of records removed from each dataset from that step. Note that these values are calculated separately, so the total of records filtered out by the process is less than the sum of the steps, since each record might meet more than one of the criteria
+
+```{r, echo = FALSE}
+reasons <- c("Starting Amount", "Total Removed", "Remaining Records",
+             "Year Before 2015", "Policy Code = 0 or NA", "Amount = 0 or NA",
+             "Amount <$1,000 or >$40,000", "Employment Length NA", "Debt-to-Income Ratio <0 or NA")
+reasons %<>% tibble()
+reasons$Declined <- c(25054319, 5894446, 19159873, 3450133, 75318, 1282, 173457, 741340, 1662815)
+reasons$Approved <- c(2132285, 699273, 1433012, 594568, 29, 29, 33, 124845, 3069)
+colnames(reasons) <- c(" ", "Declined Loans", "Approved Loans")
+reasons %<>% dplyr::select(` `, `Approved Loans`, `Declined Loans`)
+
+kable(reasons)
+
+
+```
+
+### Loan Titles
+
+In order to conform to the categories given for approved loans, the following adjustments were made to declined loan titles:
+
+* All loan titles including "auto", "automobile" or "car" (but not "card") are classified as "automotive"
+* All loan titles including "business" are classified as "business"; this includes "business", "business loan", "small business loan", etc.
+* All loan titles including "moving" are classified as "moving"
+* All loan titles including "medical" are classified as "medical"
+* All loan titles including "consolid" are classified as "debt consolidation"; this includes "debt consolidation", "consolidating debt", "to consolidate debt", etc.
+* All loan titles including "credit card" are classified as "credit card refinancing"
+* All loan titles including "green" or "renewable" are classified as "green loan"
+* All loan titles including "education" or "learning" are classified as "education"
+* All loan titles including "house" are classified as "home buying"
+* All blank loan titles are classified as "other"
+* All loan titles which appear only once are classified as other; this applied to 7 records after the other classifications.
+
+\pagebreak
+
+### Monthly Data
+
+These graphs show the distribution of loans across different months of the year. These are from the unfiltered dataset with every year included.
+
+```{r, echo = FALSE}
+data <- read_rds("approved with months")
+rejects <- read_rds("rejected with months")
+ggplot(data) + geom_bar(aes(x = month, fill = month)) + 
+  guides(fill = FALSE) + scale_x_discrete(name = NULL) + 
+  scale_y_continuous(name = "Approved Loans", labels = scales::comma)
+```
+
+```{r, echo = FALSE}
+ggplot(data = rejects) + geom_bar(aes(x = month, fill = month)) + 
+  guides(fill = FALSE) + scale_x_discrete(name = NULL) + 
+  scale_y_continuous(name = "Declined Loans", labels = scales::comma)
+```
+
+The distributions are broadly similar, but they were not used in the main body of this report because it could not be confirmed that the approved and declined loan datasets weer consistent in the way the date was recorded.
+
+\pagebreak
+
+# Appendix II - Comparison with Excluded Data
+
+### Years 2007 - 2014
+
+Although the main body of this report focuses on records from 2015 to the present, I applied some of the same analysis to 2007-2014 data as a comparison. After all filtering, there are 562,268 approved loans and 2,930,528 declined loans from that period.
+
+One significant difference, and the biggest reason to restrict analysis to 2015 and onward, is that in 2007-2014 there are over 4000 distinct loan titles even after the classifications listed in Appendix I. Another distinction is that the earlier years of Lending Club saw a higher loan approval rate overall, at approximately 16% compared to about 7% in 2015 to the present.
+
+```{r, echo = FALSE}
+old_data <- fread("pre 2015 data.csv") %>% as.tibble()
+old_data$approved %<>% as.factor()
+old_data$emp51 %<>% as.factor()
+old_data$round_amt %<>% as.factor()
+```
+
+```{r, echo = FALSE}
+ggplot(data = old_data) + geom_histogram(aes(x = amount, fill = approved), bins = 40) +
+  scale_fill_manual(name = "round_amt", labels = c("Declined", "Approved"),
+                      values = c("#FF3333", "#009E73")) +
+  scale_y_continuous(labels = scales::comma, name = NULL) +
+  guides(fill=guide_legend(title=NULL))
+```
+
+We see here that the "round amount" spikes still existed in earlier years.
+
+```{r, echo = FALSE}
+ggplot(data = old_data) + 
+  geom_bar(aes(x = emp_length, fill = approved)) + 
+  scale_y_continuous(labels = scales::comma, name = NULL) + 
+  scale_x_discrete(breaks = 1:10, name = "Employment Length") +
+  guides(fill=guide_legend(title=NULL)) +
+  scale_fill_manual(labels = c("Declined", "Approved"), values = c("#FF3333", "#009E73"))
+```
+
+A majority of loan applications were still from people with 1 year or less of employment, while the spike at 5 years is still present.
+
+
+```{r, echo = FALSE}
+ggplot(old_data %>% filter(debt_to_income < 100)) + 
+  geom_histogram(aes(x = debt_to_income, fill = approved), binwidth = 5) +
+  scale_y_continuous(labels = scales::comma, name = NULL) +
+  scale_fill_manual(name = NULL, labels = c("Declined", "Approved"),
+                    values = c("#FF3333", "#009E73")) + 
+  scale_x_continuous(name = "Debt-to-Income Ratio")
+```
+
+Debt-to-Income ratio has a similar distribution to what it had for 2015-2018; when log-transformed it again looks a bit nicer.
+
+\pagebreak
+
+### Risk Scores
+
+For declined loans, the variable "Risk_Score" is a FICO score before November 5, 2013 and a Vantage score after that. Although these scores exist in similar ranges and might appear at first glance to be the same, they are in fact distributed differently, as illustrated below (on the same x-axis for easier comparison):
+
+```{r, echo = FALSE}
+rej_fico <- read_rds("rej_fico")
+rej_vantage <- read_rds("rej_vantage")
+app_fico <- read_rds("app_fico")
+app_fico$year <- as.numeric(app_fico$year)
+```
+
+```{r, echo = FALSE}
+ggplot(data = rej_fico) + geom_histogram(aes(x = Risk_Score), fill = "#56B4E9", binwidth = 30) +
+  scale_x_continuous(name = "FICO Score", limits = c(350, 1000)) +
+  scale_y_continuous(name = "Declined Loans", labels = scales::comma)
+
+```
+
+```{r, echo = FALSE}
+ggplot(data = rej_vantage) + geom_histogram(aes(x = Risk_Score), fill = "#D55E00", binwidth = 30) +
+  scale_x_continuous(name = "Vantage Score", limits = c(350, 1000)) +
+  scale_y_continuous(name = "Declined Loans", labels = scales::comma)
+```
+
+These graphs show all recorded values of the "Risk_Score" variable in declined loans before November 2013 (first graph, FICO) and after November 2013 (second graph, Vantage).
+
+Here is the distribution of FICO scores for all approved loans 2007-2018, again plotted with the same x-axis so the graphs are easily comparable
+
+```{r, echo = FALSE}
+ggplot(data = app_fico) + geom_histogram(aes(x = risk_score), fill = "#009E73", binwidth = 30) +
+  scale_x_continuous(name = "FICO Score", limits = c(350, 1000)) +
+  scale_y_continuous(name = "Approved Loans", labels = scales::comma)
+```
+
+```{r, echo = FALSE}
+app_fico$approved <- 1
+rej_fico$approved <- 0
+rej_fico %<>% dplyr::select(risk_score = Risk_Score, approved, year)
+
+all_fico <- bind_rows(app_fico %>% filter(year <= 2013), rej_fico %>% filter(year <= 2013))
+all_fico$approved %<>% as.factor()
+```
+
+If we plot all of the FICO scores together, for approved and declined loans 2007-2013, we can see a clear cut-off where no loans are approved below about 650 and increasing approval rates above that value.
+
+```{r, echo = FALSE}
+ggplot(data = all_fico) + geom_histogram(aes(x = risk_score, fill = approved), binwidth = 30) +
+  scale_x_continuous(name = "FICO Score", limits = c(350, 1000)) +
+  scale_y_continuous(name = "Loan Applications 2007-2013", labels = scales::comma) + 
+  scale_fill_manual(name = NULL, labels = c("Declined", "Approved"),
+                      values = c("#FF3333", "#009E73"))
+```
+
+If we look at all risk scores in 2014-2018, where we know the approved and declined loans are reported differently, we see there is still a cut-off for approval. Since Vantage scores have a higher range than FICO scores, there are some high risk score values for which all loans are rejected.
+
+```{r, echo = FALSE}
+rej_vantage$approved <- 0
+rej_vantage %<>% dplyr::select(risk_score = Risk_Score, approved, year)
+
+mis_comp <- bind_rows(rej_vantage %>% filter(year >= 2014), app_fico %>% filter(year >= 2014))
+mis_comp$approved %<>% as.factor()
+```
+
+```{r, echo = FALSE}
+ggplot(data = mis_comp) + geom_histogram(aes(x = risk_score, fill = approved), binwidth = 30) +
+  scale_x_continuous(name = "Risk Score", limits = c(350, 1000)) +
+  scale_y_continuous(name = "Loan Applications 2014-2018", labels = scales::comma)+ 
+  scale_fill_manual(name = NULL, labels = c("Declined", "Approved"),
+                      values = c("#FF3333", "#009E73"))
+```
+
+\pagebreak
+
+# Appendix III - Rejected Models and model details
+
+### Details on models used
+
+For readers with technical understanding, some additional details are provided here on the models summarized in the main report
+
+#### Logistic Regression
+
+```{r, echo = FALSE}
+summary(glm)
+```
+
+#### Multi-level Logistic Regression
+
+```{r, echo = FALSE}
+summary(mlm)
+```
+
+#### Random Forest
+
+```{r, echo = FALSE}
+rf
+```
+
+```{r, echo = FALSE}
+plot(rf$err.rate[, 1])
+```
+
+### Rejected Models
+
+#### Multi-level models
+
+The following models were fit, but had slightly poorer performance in terms of accuracy and/or sensitivity on the test set than the model presented in the main report. Most of these models are significantly more complicated and thus take more time and computing resources than the simple GLM logistic regression.
+
+Several other attempted models included cross-referenced economic data by geographic region, which ended up being non-impactful to model fit.
+
+*MLM 2*
+```{r, echo = FALSE}
+mlm2 <- read_rds("balanced mlm")
+summary(mlm2)
+```
+
+```{r, echo = FALSE}
+test_preds <- invlogit(predict(mlm2, test, allow.new.levels = TRUE))
+
+test$preds <- ifelse(test_preds > 0.5, 1, 0)
+
+test_table <- table(test$approved, test$preds)
+
+test_acc <- (test_table[1,1] + test_table[2,2]) / (sum(test_table))
+
+test_sens <- test_table[2,2] / sum(test_table[2 ,])
+test_spec <- test_table[1,1] / sum(test_table[1 ,])
+
+str_glue("Test set accuracy is {format(test_acc, digits = 3)}")
+str_glue("Test set sensitivity is {format(test_sens, digits = 3)}")
+str_glue("Test set specificity is {format(test_spec, digits = 3)}")
+```
+
+*MLM 3*
+
+This model has nearly the exact same accuracy and sensitivity as the main model, but takes much longer to train. Effectively the main model is this but without using Title
+```{r, echo = FALSE}
+mlm3 <- read_rds("mlm slash")
+summary(mlm3)
+```
+
+```{r, echo = FALSE}
+test_preds <- invlogit(predict(mlm3, test, allow.new.levels = TRUE))
+
+test$preds <- ifelse(test_preds > 0.5, 1, 0)
+
+test_table <- table(test$approved, test$preds)
+
+test_acc <- (test_table[1,1] + test_table[2,2]) / (sum(test_table))
+
+test_sens <- test_table[2,2] / sum(test_table[2 ,])
+test_spec <- test_table[1,1] / sum(test_table[1 ,])
+
+str_glue("Test set accuracy is {format(test_acc, digits = 3)}")
+str_glue("Test set sensitivity is {format(test_sens, digits = 3)}")
+str_glue("Test set specificity is {format(test_spec, digits = 3)}")
+```
+
